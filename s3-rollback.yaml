@@ -20,10 +20,19 @@ Parameters:
     Type: String
     Description: If you want to limit recovery to a specific prefix, specify it here. Leave blank to roll back the entire bucket. This value will be used to select from available S3 Inventories, and is required when there is no S3 Inventory of the whole bucket.
     Default: ""
+
+  ExecutionMode:
+    Type: String
+    Description: <Bucket Rollback> mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time. <Delete Marker Removal> mode simply removes any delete markers created after the timestamp, for objects where a delete marker is the current version.
+    AllowedValues:
+      - "Bucket Rollback"
+      - "Delete Marker Removal"
+    ConstraintDescription: Please choose either "Bucket Rollback" or "Delete Marker Removal".
+    Default: "Bucket Rollback"
   
   StorageClass:
     Type: String
-    Description: The S3 storage class to copy object versions into. If in doubt, use Intelligent-Tiering.
+    Description: The S3 storage class to copy object versions into. As always with S3, if in doubt, use Intelligent-Tiering. See https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html for more information.
     AllowedValues:
       - STANDARD
       - INTELLIGENT_TIERING
@@ -31,7 +40,7 @@ Parameters:
       - GLACIER_IR
       - GLACIER
       - DEEP_ARCHIVE
-    ConstraintDescription: The S3 storage class to copy object versions into. As always with S3, if in doubt, use Intelligent-Tiering. See https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html for more information.
+    ConstraintDescription: Please choose a valid Amazon S3 storage class, e.g INTELLIGENT_TIERING.
     Default: "INTELLIGENT_TIERING"
 
   KMSKey:
@@ -67,6 +76,7 @@ Metadata:
           - BucketName
           - TimeStamp
           - Prefix
+          - ExecutionMode
           - StartS3BatchOperationsJobs
       -        
         Label:
@@ -83,6 +93,8 @@ Metadata:
           default: Prefix
         TimeStamp:
           default: Timestamp
+        ExecutionMode:
+          default: Execution Mode
         StorageClass:
           default: Copy to storage class
         KMSKey:
@@ -103,6 +115,14 @@ Conditions:
   WantKMS: !Not
     - !Equals [ !Ref KMSKey, "" ]
     
+  WantRollback: !Equals
+    - !Ref ExecutionMode
+    - "Bucket Rollback"
+
+  WantDMRemoval: !Equals
+    - !Ref ExecutionMode
+    - "Delete Marker Removal"
+
 Resources:
 
   BucketCleaner:
@@ -758,6 +778,7 @@ Resources:
 
   CreateAllKeysTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the distinct list of keys"
@@ -781,6 +802,7 @@ Resources:
 
   CreateLatestVersionsTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the latest versions of every file under the prefix"
@@ -813,6 +835,7 @@ Resources:
 
   CreateDesiredTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired version / delete markers of every file under the prefix"
@@ -848,6 +871,7 @@ Resources:
 
   CreateDesiredVersionsTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired versions of every file under the prefix"
@@ -874,6 +898,7 @@ Resources:
 
   CreateChangedKeysTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to hold the list of keys that have changed"
@@ -907,6 +932,7 @@ Resources:
 
   CreateCountVersionsTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to count an object's versions"
@@ -939,8 +965,57 @@ Resources:
           TimeStamp: !Ref TimeStamp
           GlueDB: !Ref GlueDatabase
 
+  CreateLatestDMsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: WantDMRemoval
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table listing all DMs that are the latest object version"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table listing all DMs that are created after the PIT, with no subsequent object versions
+            
+            CREATE TABLE ${GlueDB}.latest_dms WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/latest_dms_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                av.key as key,
+                av.version_id as version_id
+            from
+                ${GlueDB}.all_versions av
+            left join
+            (
+                -- Find the most recent version of all keys that were created after PIT
+                select
+                    key,
+                    max_by(version_id, last_modified_date) as version_id,
+                    max_by(last_modified_date, last_modified_date) as last_modified_date
+                from
+                    ${GlueDB}.all_versions
+                where
+                    is_delete_marker = false
+                group by
+                    key
+             ) most_recent
+            on 
+                av.key = most_recent.key
+            where
+                av.is_delete_marker
+                and av.last_modified_date > greatest(
+                    coalesce(most_recent.last_modified_date, from_unixtime(0)),
+                    from_iso8601_timestamp('${TimeStamp}')
+                )
+        
+        - ResultsBucket: !Ref AthenaResultsBucket
+          TimeStamp: !Ref TimeStamp
+          GlueDB: !Ref GlueDatabase
+
   CreateScenario1Table:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 1"
@@ -997,6 +1072,7 @@ Resources:
 
   CreateScenario2Table:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 2"
@@ -1034,6 +1110,7 @@ Resources:
 
   CreateScenario2UndoTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to *undo* Scenario 2"
@@ -1057,12 +1134,11 @@ Resources:
                 ${GlueDB}.scenario2_keys
             
         - GlueDB: !Ref GlueDatabase
-          TimeStamp: !Ref TimeStamp
           ResultsBucket: !Ref AthenaResultsBucket
-          Bucket: !Ref BucketName
 
   CreateScenario3aTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3a"
@@ -1100,6 +1176,7 @@ Resources:
 
   CreateScenario3bTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3b"
@@ -1136,6 +1213,7 @@ Resources:
 
   CreateScenario3cTable:
     Type: "AWS::Athena::NamedQuery"
+    Condition: WantRollback
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3c"
@@ -1169,6 +1247,64 @@ Resources:
         - GlueDB: !Ref GlueDatabase
           ResultsBucket: !Ref AthenaResultsBucket
           Bucket: !Ref BucketName
+
+  CreateScenario4Table:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: WantDMRemoval
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 4"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 4;
+            -- Remove delete markers that are the latest version of an object.
+
+            CREATE TABLE ${GlueDB}.scenario4_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario4_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(key) as key,
+                    version_id
+                from (
+                    ${GlueDB}.latest_dms
+                )
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario4UndoTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: WantDMRemoval
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to *undo* Scenario 4"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to *undo* Scenario 4;
+            -- Replace any delete markers removed when originally running Scenario4
+            -- This CSV can then be passed to the Scenario1 Lambda using S3 Batch Operations
+
+            CREATE TABLE ${GlueDB}.scenario4_undo_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario4_undo_keys_table/'
+            ) as
+            select
+                bucket,
+                key
+            from
+                ${GlueDB}.scenario4_keys
+            
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
 
   ManifestMaker:
     Type: "AWS::Lambda::Function"
@@ -1519,6 +1655,7 @@ Resources:
                   - !GetAtt AthenaResultsBucket.Arn
         
   CSVChecker:
+    Condition: UseInventoryCSV
     Type: "AWS::Lambda::Function"
     Properties:
       Runtime: python3.13
@@ -1757,11 +1894,11 @@ Resources:
                           "LambdaInvoke": {
                               "FunctionArn": function_arn,
                               "InvocationSchemaVersion" : "2.0",
-                              "UserArguments" : {
-                                  "StorageClass" : storage_class,
-                              }
                           }
                       }
+                      
+                      if storage_class: # A copy with storage class specified
+                          kwargs["Operation"]["LambdaInvoke"]["UserArguments"]["StorageClass"] = storage_class
                       
                       if kms_key: # Want KMS encryption
                           kwargs["Operation"]["LambdaInvoke"]["UserArguments"]["KMSKey"] = kms_key
@@ -1863,7 +2000,7 @@ Resources:
                   - "lambda:InvokeFunction"
                 Resource:
                   - !GetAtt S3BatchOpsDeleteFunction.Arn
-                  - !GetAtt S3BatchOpsCopyFunction.Arn
+                  - !If [ WantRollback, !GetAtt S3BatchOpsCopyFunction.Arn, !Ref "AWS::NoValue" ]
 
   S3BatchOpsDeleteFunction:
     Type: "AWS::Lambda::Function"
@@ -1879,6 +2016,8 @@ Resources:
           from urllib.parse import unquote_plus
           from botocore.exceptions import ClientError
           
+          s3 = boto3.client('s3')
+          
           def handler(event, context):
           
               results = {
@@ -1888,8 +2027,6 @@ Resources:
                   'results': []
               }
               
-              s3 = boto3.client('s3')
-          
               for task in event['tasks']:
           
                   task_id = task['taskId']
@@ -1904,7 +2041,7 @@ Resources:
                       if s3_version_id:
                         s3.delete_object(Bucket=s3_bucket, Key=s3_key, VersionId=s3_version_id)
                       else:
-                        s3.delete_object(Bucket=s3_bucket, Key=s3_key)                      
+                        s3.delete_object(Bucket=s3_bucket, Key=s3_key, IfMatch='*')                      
           
                       result['resultCode'] = "Succeeded"
                       result['resultString'] = "Deleted"
@@ -1913,6 +2050,9 @@ Resources:
                       # Handle specific S3 errors
                       error_code = e.response['Error']['Code']
                       error_message = e.response['Error']['Message']
+                      request_id = e.response['ResponseMetadata']['RequestId']
+                      http_status_code = e.response['ResponseMetadata']['HTTPStatusCode']
+                      retry_attempts = e.response['ResponseMetadata']['RetryAttempts']
                   
                       if error_code == 'NoSuchKey':
                           # Object doesn't exist - might have been deleted already
@@ -1922,15 +2062,14 @@ Resources:
                       elif error_code == 'AccessDenied':
                           # Permission issues
                           result['resultCode'] = "PermanentFailure"
-                          result['resultString'] = f"Access denied deleting {s3_key} with version {s3_version_id} from bucket {s3_bucket}"
+                          result['resultString'] = f"Access denied. RequestID = {request_id}."
           
                       else:
                           # Other client errors
                           result['resultCode'] = "PermanentFailure"
-                          result['resultString'] = f"Error deleting {s3_key} with version {s3_version_id} from {s3_bucket}: {error_code} - {error_message}"
+                          result['resultString'] = f"{error_code} - {error_message}. HTTP Status Code = {http_status_code}. Retry Attempts = {retry_attempts}. RequestID = {request_id}."
           
                   results['results'].append(result)
-          
               return results
 
   S3BatchOpsDeleteFunctionRole:
@@ -1969,6 +2108,7 @@ Resources:
 
   S3BatchOpsCopyFunction:
     Type: "AWS::Lambda::Function"
+    Condition: WantRollback
     Properties:
       Runtime: python3.13
       MemorySize: 2048
@@ -1983,6 +2123,9 @@ Resources:
           from botocore.exceptions import ClientError
           from boto3.s3.transfer import TransferConfig
           
+          client_config = botocore.config.Config(max_pool_connections = 1000)
+          s3 = boto3.client('s3', config = client_config)
+          
           def handler(event, context):
           
               results = {
@@ -1992,9 +2135,6 @@ Resources:
                   'results': []
               }
               
-              client_config = botocore.config.Config(max_pool_connections = 1000)
-              s3 = boto3.client('s3', config = client_config)
-          
               for task in event['tasks']:
           
                   task_id = task['taskId']
@@ -2052,6 +2192,7 @@ Resources:
 
   S3BatchOpsCopyFunctionRole:
     Type: "AWS::IAM::Role"
+    Condition: WantRollback
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2189,6 +2330,7 @@ Resources:
 
   ExecuteCreateLatestVersionsTable:
     Type: "Custom::ExecuteCreateLatestVersionsTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateAllVersionsTable
@@ -2201,6 +2343,7 @@ Resources:
 
   ExecuteCreateDesiredTable:
     Type: "Custom::ExecuteCreateDesiredTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateAllVersionsTable
@@ -2213,6 +2356,7 @@ Resources:
 
   ExecuteCreateDesiredVersionsTable:
     Type: "Custom::ExecuteCreateDesiredVersionsTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateDesiredTable
@@ -2225,6 +2369,7 @@ Resources:
 
   ExecuteCreateChangedKeysTable:
     Type: "Custom::ExecuteCreateChangedKeysTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateDesiredVersionsTable
@@ -2238,6 +2383,7 @@ Resources:
 
   ExecuteCreateCountVersionsTable:
     Type: "Custom::ExecuteCreateCountVersionsTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateAllVersionsTable
@@ -2250,8 +2396,22 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCountVersionsTable/"
 
+  ExecuteCreateLatestDMsTable:
+    Type: "Custom::ExecuteCreateLatestDMsTableFunction"
+    Condition: WantDMRemoval
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateLatestDMsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestDMsTable/"
+
   ExecuteCreateScenario1Table:
     Type: "Custom::ExecuteCreateScenario1TableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateAllVersionsTable
@@ -2266,6 +2426,7 @@ Resources:
 
   ExecuteCreateScenario2Table:
     Type: "Custom::ExecuteCreateScenario2TableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateCountVersionsTable
@@ -2278,6 +2439,7 @@ Resources:
 
   ExecuteCreateScenario2UndoTable:
     Type: "Custom::ExecuteCreateScenario2UndoTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateScenario2Table
@@ -2290,6 +2452,7 @@ Resources:
 
   ExecuteCreateScenario3aTable:
     Type: "Custom::ExecuteCreateScenario3aTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateChangedKeysTable
@@ -2303,6 +2466,7 @@ Resources:
 
   ExecuteCreateScenario3bTable:
     Type: "Custom::ExecuteCreateScenario3bTableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateChangedKeysTable
@@ -2315,7 +2479,8 @@ Resources:
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
 
   ExecuteCreateScenario3cTable:
-    Type: "Custom::ExecuteCreateScenario3cViewTable"
+    Type: "Custom::ExecuteCreateScenario3TableFunction"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteCreateChangedKeysTable
@@ -2327,16 +2492,37 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3cTable/"
 
+  ExecuteCreateScenario4Table:
+    Type: "Custom::ExecuteCreateScenario4TableFunction"
+    Condition: WantDMRemoval
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateLatestDMsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario4Table.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario4Table/"
+
+  ExecuteCreateScenario4UndoTable:
+    Type: "Custom::ExecuteCreateScenario4UndoTableFunction"
+    Condition: WantDMRemoval
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateScenario4Table
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario4UndoTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario4UndoTable/"
+
   ExecuteManifestMaker:
     Type: "Custom::ExecuteManifestMakerFunction"
     DependsOn:
     - ExecuteClean
-    - ExecuteCreateScenario1Table
-    - ExecuteCreateScenario2Table
-    - ExecuteCreateScenario2UndoTable
-    - ExecuteCreateScenario3aTable
-    - ExecuteCreateScenario3bTable
-    - ExecuteCreateScenario3cTable
+    - ExecuteCreateAllVersionsTable
     Properties:
       ServiceTimeout: 900
       ServiceToken: !GetAtt ManifestMaker.Arn
@@ -2344,15 +2530,27 @@ Resources:
       TableSource: Tables/
       ManifestDestination: Manifests/
       Tables:
-        - scenario1
-        - scenario2
-        - scenario2_undo
-        - scenario3a
-        - scenario3b
-        - scenario3c
+        - !If [ WantRollback, "scenario1", !Ref "AWS::NoValue" ]
+        - !If [ WantRollback, "scenario2", !Ref "AWS::NoValue" ]
+        - !If [ WantRollback, "scenario2_undo", !Ref "AWS::NoValue" ]
+        - !If [ WantRollback, "scenario3a", !Ref "AWS::NoValue" ]
+        - !If [ WantRollback, "scenario3b", !Ref "AWS::NoValue" ]
+        - !If [ WantRollback, "scenario3c", !Ref "AWS::NoValue" ]
+        - !If [ WantDMRemoval, "scenario4", !Ref "AWS::NoValue" ]
+        - !If [ WantDMRemoval, "scenario4_undo", !Ref "AWS::NoValue" ]
+      Dependency:
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario1Table.State, !Ref "AWS::NoValue"]
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario2Table.State, !Ref "AWS::NoValue"]
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario2UndoTable.State, !Ref "AWS::NoValue"]
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario3aTable.State, !Ref "AWS::NoValue"]
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario3bTable.State, !Ref "AWS::NoValue"]
+        - !If [WantRollback, !GetAtt ExecuteCreateScenario3cTable.State, !Ref "AWS::NoValue"]
+        - !If [WantDMRemoval, !GetAtt ExecuteCreateScenario4Table.State, !Ref "AWS::NoValue"]
+        - !If [WantDMRemoval, !GetAtt ExecuteCreateScenario4UndoTable.State, !Ref "AWS::NoValue"]
 
   ExecuteS3BatchOpsDeleteCreator1:
     Type: "Custom::ExecuteS3BatchOpsCreator"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteManifestMaker
@@ -2370,6 +2568,7 @@ Resources:
 
   ExecuteS3BatchOpsDeleteCreator2:
     Type: "Custom::ExecuteS3BatchOpsCreator"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteManifestMaker
@@ -2388,6 +2587,7 @@ Resources:
 
   ExecuteS3BatchOpsCopyCreator3b:
     Type: "Custom::ExecuteS3BatchOpsCreator"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteManifestMaker
@@ -2408,6 +2608,7 @@ Resources:
 
   ExecuteS3BatchOpsCopyCreator3c:
     Type: "Custom::ExecuteS3BatchOpsCopyCreator"
+    Condition: WantRollback
     DependsOn:
     - ExecuteClean
     - ExecuteManifestMaker
@@ -2426,31 +2627,61 @@ Resources:
       S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
       StartJob: !Ref StartS3BatchOperationsJobs
 
+  ExecuteS3BatchOpsDeleteCreator4:
+    Type: "Custom::ExecuteS3BatchOpsCreator"
+    Condition: WantDMRemoval
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario4.csv"
+      HasVersionIds: True
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario4"
+      Description: "Scenario 4 - Remove latest DMs"
+      FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
 Outputs:    
   Manifests:
     Description: Location of the Manifests for S3 Batch Operations
     Value: !Sub "s3://${AthenaResultsBucket}/Manifests/"
  
   S3BatchOperationsDelete1Job:
+    Condition: WantRollback
     Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 1)
     Value: !GetAtt ExecuteS3BatchOpsDeleteCreator1.Output
     
   S3BatchOperationsDelete2Job:
+    Condition: WantRollback
     Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 2)
     Value: !GetAtt ExecuteS3BatchOpsDeleteCreator2.Output
     
   S3BatchOperationsCopy3bJob:
+    Condition: WantRollback
     Description: AWS Management Console link for S3 Batch Operations Copy Job (Scenario 3b)
     Value: !GetAtt ExecuteS3BatchOpsCopyCreator3b.Output
     
   S3BatchOperationsCopy3cJob:
+    Condition: WantRollback
     Description: AWS Management Console link for S3 Batch Operations Copy Job (Scenario 3c)
     Value: !GetAtt ExecuteS3BatchOpsCopyCreator3c.Output
 
   CopyRole3b:
+    Condition: WantRollback
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3b)
     Value: !GetAtt S3BatchOpsExecutorRole.Arn
 
   CopyRole3c:
+    Condition: WantRollback
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3c)
     Value: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+
+  S3BatchOperationsDelete4Job:
+    Condition: WantDMRemoval
+    Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 4)
+    Value: !GetAtt ExecuteS3BatchOpsDeleteCreator4.Output
