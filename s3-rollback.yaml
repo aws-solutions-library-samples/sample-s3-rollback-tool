@@ -281,9 +281,7 @@ Resources:
               for b in ["Source", "Destination"]:
               
                 bucket = event["ResourceProperties"].get(f"{b}Bucket")
-                print(f"Check Versioning for {b} Bucket '{bucket}'")
-                if bucket == "":
-                  print("Empty, skipping")
+                if not bucket:
                   continue 
               
                 # Ensure bucket has versioning enabled.
