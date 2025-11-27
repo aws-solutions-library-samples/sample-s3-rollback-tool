@@ -71,7 +71,7 @@ Parameters:
 
   InventoryCSVLocation:
     Type: String
-    Description: S3 location of a CSV inventory file to use instead of S3 Inventory (e.g. s3://bucket/prefix/inventory.csv). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
+    Description: S3 location of a CSV inventory file to use instead of S3 Inventory or Metadata (e.g. s3://bucket/prefix/inventory.csv). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
     AllowedPattern: "^(|s3://[a-zA-Z0-9._-]+(/[^/]+)*\\.csv)$"
     ConstraintDescription: Please enter an S3 location ending in .csv e.g. s3://mybucket/prefix/inventory.csv
     Default: ""
