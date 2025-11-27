@@ -334,7 +334,7 @@ To return the state of a dataset to an earlier time, this tool exposes or copies
 
 ## KMS permissions
 
-The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenario 3). The ARNs that require permissions are shown in the `CopyRole3b` and `CopyRole3c` output of the CloudFormation stack.
+The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenarios 3 and 5). The ARNs that require permissions are shown in the `CopyRole3b`, `CopyRole3c` and `CopyRole5b` output of the CloudFormation stack.
 
 Permissions required:
 - KMS decrypt for object versions to be copied
