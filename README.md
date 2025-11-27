@@ -36,21 +36,19 @@
 - [Authors](#authors)
 
 ## Overview
-If you want to revert lots of changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert 10 million changes, within a bucket containing 10 billion objects, in under 1 hour. Or 100 million changes in under 5 hours.
+If you want to revert undesired changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert thousands of changes in under 15 minutes, 10 million changes in under an hour, or 100 million changes in under 5 hours. Alternatively, it can recreate a desired point in time into an empty bucket.
 
-It can also revert thousands of changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation, or it can recreate a desired point in time into an empty bucket.
+The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled and up to 3 billion objects in scope for rollback, you can get started in only 15 minutes. If you don't have S3 Metadata enabled, or have even more objects in scope, you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
->Unlike other solutions, it does not require anything to be in place prior to the undesired event, other than [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html). See [Prerequisites](#prerequisites).
+[Watch a 10 minute demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
 
-[Watch the demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class by [S3 Lifecycle transitions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html), or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html), are not in scope as these do not create new object versions.
 
-Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class by [S3 Lifecycle](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html), or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html), are not in scope as these do not create new object versions.
+The tool will not permanently delete any data. In the default 'Bucket Rollback' mode it adds and removes delete markers, and copies object versions where necessary, to revert a dataset to an earlier time with the fewest possible operations. This is illustrated in the following animation:
 
-The tool will not permanently delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to  revert a dataset to an earlier time with the fewest possible operations.
+![Rollback tool for Amazon S3 animated overview](images/s3rollbacktool-animated.gif) 
 
-![Rollback tool for Amazon S3 animated overview](images/s3rollbacktool-animated.gif)
-
-> In 'Delete Marker Removal' mode, it will simply remove  delete markers placed after the specified time, down to the next regular object version, from objects where a delete marker is the current version. 
+> In 'Delete Marker Removal' mode, it will simply remove delete markers placed after the specified time, down to the next regular object version, from objects where a delete marker is the current version. 
 
 ![Architecture diagram](images/arch-diagram.png)
 
@@ -58,7 +56,7 @@ The tool will not permanently delete any data - it works by adding and removing 
 
 You are responsible for the cost of the AWS services used while running this Guidance. 
 
-For example, as of 2025-11-06, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $11**, detailed in the following table: 
+For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $11**, detailed in the following table: 
 
 | AWS service | Dimensions | Cost [USD] |
 |-------------|------------|------------|
@@ -67,30 +65,35 @@ For example, as of 2025-11-06, if you use this tool in 'Bucket Rollback' mode ag
 | [Amazon S3 Batch Operations](https://aws.amazon.com/s3/pricing/) | Jobs and objects processed | $4 |
 | [AWS Lambda](https://aws.amazon.com/lambda/pricing/) | Compute time and requests | $1 |
 
-- `*` These S3 storage classes do not incur a per-GB retrieval charge when copied. 
+- `*` Objects in these S3 storage classes are not subject to a per-GB retrieval charge when copied. 
 - Additional storage charges for copies are not included in the above estimates.
 - Athena charges can be expected to scale with objects in the inventory. 
 - Following the [simple demo](#simple-demo) costs $1. 
 - In testing, deleting 100 million delete markers incurred $36 in Lambda charges.  Lambda compute time is higher for COPY than DELETE operations, and scales with object size.
 - 'Copy to Bucket' mode copies every object (that was current at the timestamp) using S3 Batch Operations and Lambda. Cross-region copies will incur cross-region data transfer charges, and the lower throughput may increase Lambda compute time.
 - S3 does not charge for DELETE operations.
+- If the CloudFormation stack is not deleted after rollback is complete, ongoing S3 storage charges will apply for the temporary S3 bucket. See [Cleanup](#cleanup).
 
 
 ## Prerequisites
 
-1. [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) must be enabled on your Amazon S3 bucket.
+1. [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) must be enabled on your Amazon S3 bucket, and must have been enabled prior to the undesired event.
 
 2. To return the state of a dataset to an earlier time, this tool exposes or copies desired versions of objects. **These desired versions must still exist**. See the section [Ensuring recoverability](#ensuring-recoverability) for more information.
 
-3. A current inventory of the bucket is required. This can be provided manually (see the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), or the tool can detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html). Soon it will also support [S3 Metadata live inventory tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html).
-     
-    - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
+3. A current inventory list of the bucket is required.
+    - Ideally, [S3 Metadata live inventory](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) is enabled on your bucket. For buckets with over a million objects, this is the fastest way for the tool to learn the current state of the bucket. S3 Metadata support has been tested up to 3 billion objects.
+        - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
+        - The S3 Metadata table configuration must not use KMS encryption. If it does, or you have any other challenges with using S3 Metadata, you can choose not to use it during deployment.
+        - *If you have more than 3B objects in scope, and want to use S3 Metadata with this tool, please contact the [authors](#authors) either directly or via your AWS account team.*
+    - If S3 Metadata is not configured on your bucket, or you chose not to use it, the tool will attempt to detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
+        - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
+    - An inventory list can be provided manually, and will be used in preference of the above. See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
 
-4. **The operations you want to roll back must be included in the inventory**. S3 Inventory reports are delivered daily (or weekly) and are eventually consistent and might not include recently added or deleted objects. This can add more than a day to the start of your recovery time. 
+4. **The operations you want to roll back must be included in the inventory**. 
+    - S3 Inventory reports are delivered daily (or weekly), are eventually consistent, and might not include recently added or deleted objects. This can add more than a day to the start of your recovery time.
+    - S3 Metadata support combines the live inventory table with the latest updates from the journal table, for the fastest start to your rollback.
 5. For 'Copy to Bucket' mode, the destination bucket must already exist and have S3 Versioning enabled. This destination bucket, or the prefix in scope, **should be empty**. It can be in any AWS Region. If your destination bucket is in a different AWS Account, see the note in [Copy to Bucket mode](#copy-to-bucket-mode-1).
-
->  Note: [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) provides up-to-date inventories of your buckets, at any scale. Support for these is coming soon.
-
 
 ## Deploying and Running the Guidance
 
@@ -98,15 +101,16 @@ Before reverting changes, you may wish to prevent further changes taking place, 
 
 1. **Bucket**: The name of the bucket to roll back or copy from.
 2. **TimeStamp**: The date and time to roll back to *in the UTC timezone*, in ISO `yyyy-mm-ddThh:mm:ss` format. For example: `2025-08-30T02:00:00`.
-3. **Prefix**: If you want to limit recovery to a specific prefix, specify it here,  or leave blank to roll back the entire bucket. This will be used to select from available S3 Inventories, and is required if S3 Inventory is being used, unless there is an inventory report with the whole bucket in scope.
+3. **Prefix**: If you want to limit recovery to a specific prefix, specify it here, or leave blank to roll back the entire bucket. This will be used to select from available S3 Inventories, and is required if S3 Inventory is being used, unless there is an inventory report with the whole bucket in scope.
 4. **Execution Mode**: 
     - **Bucket Rollback** is the default mode that creates S3 Batch Operations jobs to revert all changes in the bucket. This mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time.
     - **Delete Marker Removal** mode simply removes delete markers placed after the timestamp, from objects where a delete marker is the current version. It will recover all objects that have been soft-deleted after the timestamp, including objects written or overwritten since the timestamp, back to their most recent version. The parameters **Copy to storage class** and **Copy using KMS key** are not used in this mode.
     - **Copy to Bucket** makes no changes to the original bucket. It recreates the precise state from an earlier point in time in *a different* bucket, by copying only the object versions which were current at the timestamp.
 4. **Start S3 Batch Operations jobs**: The tool creates one or more S3 Batch Operations jobs to carry out S3 operations, but by default it will *not* start them. If you are working with a test dataset and do not need to validate the operations or adjust permissions (e.g. [KMS](#kms-permissions)), change this to `Yes`.
+5. **Use S3 Metadata tables**: Change this to `NO` to skip the check for S3 Metadata journal and live inventory tables. This is helpful if you have KMS encryption on either table, or any other errors (such as permissions).
 5. **Copy to storage class**: The Amazon S3 storage class to copy object versions into. [If in doubt, use the Intelligent-Tiering storage class](https://catalog.workshops.aws/awscff/en-US/playbooks/storage/s3/2-choosing-storage-class). See [the S3 documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html) for more information.
 6. **Copy using KMS key (optional)**: If object versions should be created using a KMS encryption key, specify it here. Leave blank for bucket default. *Permissions to KMS keys are not updated by this tool - see the* [**KMS permissions**](#kms-permissions) *section.*
-7. **Specify CSV inventory (optional)**: The S3 location of a CSV containing a current inventory of the bucket. This optional field allows you to provide a list of object versions, instead of using [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html). See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
+7. **Specify CSV inventory (optional)**: The S3 location of a CSV containing a current inventory of the bucket. This optional field allows you to provide a list of object versions, instead of using [S3 Metadata](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) or [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html). See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
 8. **Destination Bucket (optional)**: For use only with 'Copy to Bucket' mode. The tool will copy all objects to this bucket that were current at the timestamp.
 
 <details>
@@ -142,7 +146,7 @@ When you no longer need the manifests and other artifacts created by the tool, s
 
 Users can [see the version history of a single object key in the S3 console](https://docs.aws.amazon.com/AmazonS3/latest/userguide/list-obj-version-enabled-bucket.html), and reverting a single object to an earlier version is as simple as [making a copy of the desired version to the same object key name](https://docs.aws.amazon.com/AmazonS3/latest/userguide/RestoringPreviousVersions.html), or [deleting a delete marker](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManagingDelMarkers.html). If an undesired new object has been placed (i.e. a ‘non-overwrite PUT’, not an overwrite of an existing object), it can have a delete marker placed on it with a DELETE operation.
 
-This solution enables restoration at scale, finding changes within buckets containing billions of objects in minutes (using [Amazon Athena](https://aws.amazon.com/athena/)). It then determines the most efficient operations needed to revert those changes, and creates [S3 Batch Operations](https://aws.amazon.com/s3/features/batch-operations/) jobs to enact them. *By default, these jobs are not started automatically*. Users should review the jobs and their manifests to ensure the rollback operations are desired, before proceeding to run the jobs. The jobs can be found in the S3 Batch Operations console, or the CloudFormation output.
+The Rollback Tool for Amazon S3 enables restoration at scale, finding changes within buckets containing billions of objects in minutes (using [Amazon Athena](https://aws.amazon.com/athena/)). It then determines the most efficient operations needed to revert those changes, and creates [S3 Batch Operations](https://aws.amazon.com/s3/features/batch-operations/) jobs to enact them. *By default, these jobs are not started automatically*. Users should review the jobs and their manifests to ensure the rollback operations are desired, before proceeding to run the jobs. The jobs can be found in the S3 Batch Operations console, or the CloudFormation output.
 
 If you prefer to copy your dataset into an empty bucket or prefix, as it was at a point in time, choose the 'Copy to Bucket' mode. Note that this will require copying *every* object that was a current version at the chosen timestamp, and is likely to be significantly slower and more expensive than rolling back in place. 
 
@@ -176,10 +180,11 @@ Scenarios differ depending on the selected mode. For each object key (name) in s
 
 The tool requires an inventory of the bucket or prefix in scope. If none is available, the deployment will fail.
 
-* If the **Specify CSV inventory** CloudFormation stack parameter has an entry, the tool will read it from the specified S3 location. If it cannot read or process this file, the deployment will fail.
-* Otherwise, the tool will look at the S3 Inventory configuration of the selected bucket. It evaluates the available inventories, and will use the latest S3 Inventory report that is in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format and includes all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). If a prefix has been specified in the CloudFormation deployment, the tool will prioritize inventories matching or containing the specified prefix. If no prefix is specified, there must be a valid S3 Inventory configuration containing all objects in the bucket, or the deployment will fail.
-
->  Note: [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) provides up-to-date inventories of your buckets, at any scale. Support for these is coming soon.
+- If the **Specify CSV inventory** CloudFormation stack parameter has an entry, the tool will read it from the specified S3 location. If it cannot read or process this file, the deployment will fail.
+- If not, the tool will look at the configuration of the selected bucket. If the bucket has an [S3 Metadata live inventory table](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) configured and in active status, the tool will query the bucket's S3 Metadata tables (using any specified prefix as a filter).
+    - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
+    - The S3 Metadata table configuration must not use KMS encryption. If it does, or you have any other challenges with using S3 Metadata, you can choose not to use it during deployment by changing **Use S3 Metadata tables** to `NO`.
+- Otherwise, the tool looks at the bucket's S3 Inventory configuration. It evaluates the available S3 Inventory reports, and chooses the latest one that is in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format and includes all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). If a prefix has been specified in the CloudFormation deployment, the tool will prioritize inventory configurations matching or containing the specified prefix. If no prefix was specified, there must be a valid S3 Inventory configuration containing all objects in the bucket, or the deployment will fail. 
 
 
 The CloudFormation template creates the following resources:
@@ -273,14 +278,13 @@ If you have up to 100 million objects in your bucket, or are looking to perform 
 Copy your output CSV into another S3 bucket in the region you are working in. You can do this using the [AWS CLI](https://aws.amazon.com/cli/) with `aws s3 cp s3_object_versions.csv s3://my-s3-bucket/prefix/name.csv` - note the object name must end `.csv`.
 
 
->  Note: [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) provides up-to-date inventories of your buckets, at any scale. Support for these is coming soon.
-
 
 ## Simple demo
 
 For a simple demonstration example, costing $0.75-$1.00 (for the three to four S3 Batch Operations jobs), perform the following:
 
 1. Create a new S3 bucket for testing, with versioning enabled. Keep all other defaults.
+    - Optionally enable S3 [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) for the bucket, without KMS encryption, and wait for the live inventory table to have status 'Active'.
 2. Create text files `a` and `b`, and upload them to the new bucket. **This is your desired (good) state**. Note the time, adjusted to the UTC timezone.
    - The bucket will look like this in the console:
    
@@ -301,7 +305,7 @@ For a simple demonstration example, costing $0.75-$1.00 (for the three to four S
    
    ![DT state with versions](images/badstate(versions).png)
 
-4. Create a real-time inventory (see [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), and copy the output CSV into S3.
+4. If you did not enable S3 Metadata live inventory tables, instead create a real-time inventory (see [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), and copy the output CSV into S3.
 5. Deploy the [CloudFormation template](s3-rollback.yaml).
    - Enter the name of the test bucket you just created.
    - Enter a timestamp (in UTC) after step 2 but before step 3. In this example, it was `2025-08-22T11:01:00`.
@@ -330,7 +334,7 @@ To return the state of a dataset to an earlier time, this tool exposes or copies
 
 ## KMS permissions
 
-The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenario 3). The ARNs that require permissions are shown in the `CopyRole3b` and `CopyRole3c` output of the CloudFormation stack.
+The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenario 3). The ARNs that require permissions are shown in the `CopyRole3b` and `CopyRole3c` output of the CloudFormation stack.
 
 Permissions required:
 - KMS decrypt for object versions to be copied
@@ -340,7 +344,7 @@ KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE opera
 
 ## AWS Lambda concurrency reservations
 
-**This tool does not assign [reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html)** to the Lambda functions it creates, and may consume all the available [AWS Lambda concurrent execution quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html#compute-and-storage). **If you have concerns about this, review the S3 Batch Operations tasks that use Lambda (scenarios 1, 2 and 3c), and [adjust the Lambda functions accordingly](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html#configuring-concurrency-reserved) before running the jobs**. We made this design decision because 1/ at the time the functions are created the tool does not know the number of objects (if any) in scope for the relevant scenarios, 2/ we don't know the Lambda concurrent execution quota, or how much it is appropriate to consume, and 3/ when a function has reserved concurrency, no other function can use that concurrency. Any reservation assigned by the tool would have been held until the CloudFormation stack was deleted.
+**This tool does not assign [reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html)** to the Lambda functions it creates, and may consume all the available [AWS Lambda concurrent execution quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html#compute-and-storage). **If you have concerns about this, review the S3 Batch Operations tasks that use Lambda (scenarios 1, 2, 3c, 4 and 5), and [adjust the Lambda functions accordingly](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html#configuring-concurrency-reserved) before running the jobs**. We made this design decision because 1/ at the time the functions are created the tool does not know the number of objects (if any) in scope for the relevant scenarios, 2/ we don't know the Lambda concurrent execution quota, or how much it is appropriate to consume, and 3/ when a function has reserved concurrency, no other function can use that concurrency. Any reservation assigned by the tool would have been held until the CloudFormation stack was deleted.
 
 The Lambda functions created by this tool (for use with S3 Batch Operations) have been tested with up to 1000 concurrent executions. Please see [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) in the AWS documentation.
 
@@ -348,14 +352,13 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
 ## FAQs
 
 1. What did I need to have in place prior to an event that I want to recover from, in order to use this tool?
-    - S3 Versioning must have been enabled before the time of the event. Object versions cannot be recovered if they have since been permanently deleted (either directly or by a lifecycle rule). See [Prerequisites](#prerequisites).
-    - If you don’t have an S3 Inventory from after the event, you will need to enable this and wait for it to create an inventory of your S3 bucket. Or you can LIST the contents of your bucket into a CSV - see [**Creating a real-time inventory using the ListObjectVersions API**](#creating-a-real-time-inventory-using-the-listobjectversions-api).
+    - See [Prerequisites](#prerequisites).
 2. What about changes that took place after the inventory was created, or after the rollback process was started?
-    - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenarios 3 and 5), those copies will be repeated as it isn't possible to tell from an inventory that the current object version's data is identical to the desired version.
+    - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenarios 3 and 5), those copies will be repeated as it isn't possible to be certain (from an inventory) that the current object version's data is identical to the desired version.
 3. I used this tool to roll back my bucket, and want to undo the changes. Can I do that?
     - Yes, provided you have not yet deleted the CloudFormation stack from the original deployment. 
     - For Bucket Rollback mode, This is a 2-step process:
-      1. Once you have an inventory that includes the changes made by this tool, deploy the tool again in **Bucket Rollback** mode to roll back to the point in time just prior to the initial deployment. If you have S3 Metadata live inventory enabled, simply wait 15 minutes to ensure all changes have been written to the journal (`S3 Metadata support is coming soon`). 
+      1. Once you have an inventory that includes the changes made by this tool, deploy the tool again in **Bucket Rollback** mode to roll back to the point in time just prior to the initial deployment. If you have S3 Metadata live inventory enabled, simply wait 15 minutes to ensure all changes have been written to the journal table, as the tool incorporates uncoalesced journal entries. 
       2. Once the above is complete, you need to re-create any delete markers removed by the original deployment, as the updated inventory has no knowledge of these. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario2_undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
     - For Delete Marker Removal mode, you need to re-create any delete markers removed by the original deployment. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario4_undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
 4. What happens when I delete the CloudFormation stack?
@@ -387,15 +390,15 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
 
 ## Cleanup
 
-As the tool is deployed once per use, it should be removed once the jobs are complete and the reports are no longer required.
+As the tool is deployed once per use, it should be removed once the jobs are complete and the reports, tables and manifests are no longer required.
 
-To clean up, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool, as well as all the resources it created.
+To clean up, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool (which might be required for undo - see FAQ 3), as well as all the resources it created.
 
 ## Tenets
 
 * **Works at any scale**: Designed to support 10B object buckets with 1B changes. Efficiency is key to achieving this. Re-running with a new inventory (to catch up, or following failures/cancellations) will not repeat completed operations (where possible, see FAQ 2).
 * **Fast at any scale:** Revert 1M changes in a 10B object bucket in under 1 hour, end to end, using S3 Inventory. Delete 100M delete markers in 3.5 hours (with 1000 concurrent lambda executions, and where S3 prefix partitioning permits). Revert a few thousand changes in a 1M object bucket in under 15 minutes, including real-time CSV inventory creation.
-* **Do no harm:** Do not delete data (never regular object versions, only delete markers). S3 Batch Operations jobs are created but not started by default. Ensure S3 Versioning is enabled.
+* **Do no harm:** Do not delete data (never regular object versions, only delete markers). Create S3 Batch Operations jobs but do not start them by default. Ensure S3 Versioning is enabled.
 * **Flexible**: Use any inventory. Give users control of prefix and which operations to carry out. 
 * **No assumptions**: Don’t assume which operations the user wants to run, which storage class to copy to, or encryption to use for copies. We can’t know what’s ‘correct’, so we ask.
 
@@ -417,10 +420,11 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
 - 2025-10-31 
     - Added Remove Delete Marker mode
     - 4x improvement in Lambda function performance
-    - updated readme.md to comply with new repository requirements.
+    - Updated readme.md to comply with new repository requirements
 - 2025-11-06
     - Added 'Copy to Bucket' mode
     - Updated GitHub references following the move to https://github.com/aws-solutions-library-samples/
+- 2025-11-27 - Updated to include support for S3 Metadata tables
 
 ## Notices
 

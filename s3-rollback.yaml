@@ -60,6 +60,15 @@ Parameters:
     ConstraintDescription: Please select YES or NO.
     Default: "NO"
 
+  UseMetadata:
+    Type: String
+    Description: If S3 Metadata is enabled on the bucket, should the tool attempt to use it?
+    AllowedValues:
+      - "YES"
+      - "NO"
+    ConstraintDescription: Please select YES or NO.
+    Default: "YES"
+
   InventoryCSVLocation:
     Type: String
     Description: S3 location of a CSV inventory file to use instead of S3 Inventory (e.g. s3://bucket/prefix/inventory.csv). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
@@ -89,6 +98,7 @@ Metadata:
         Label:
           default: "Optional parameters"
         Parameters:
+          - UseMetadata
           - StorageClass
           - KMSKey
           - InventoryCSVLocation
@@ -103,6 +113,8 @@ Metadata:
           default: Timestamp
         ExecutionMode:
           default: Execution Mode
+        UseMetadata:
+          default: Use S3 Metadata tables
         StorageClass:
           default: Copy to storage class
         KMSKey:
@@ -119,6 +131,14 @@ Conditions:
     - !Ref InventoryCSVLocation
     - ""
   
+  CreateInventoryFromMetadata: !And
+    - !Equals
+      - !Ref InventoryCSVLocation
+      - ""
+    - !Equals
+      - !Ref UseMetadata
+      - "YES"
+
   UseInventoryCSV: !Not
     - !Equals [ !Ref InventoryCSVLocation, "" ]    
  
@@ -152,6 +172,10 @@ Conditions:
     - !Equals
       - !Ref ExecutionMode
       - "Delete Marker Removal"
+      
+  UseMetadata: !Equals
+    - !Ref UseMetadata
+    - "YES"
 
 Rules:
 
@@ -366,9 +390,21 @@ Resources:
           Name: !Ref GlueDatabase
       Permissions:
         - "CREATE_TABLE"
-      PermissionsWithGrantOption:
-        - "CREATE_TABLE"
+      PermissionsWithGrantOption: []
 
+  S3TablesPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Condition: CreateInventoryFromMetadata
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt QueryExecutorRole.Arn
+      Permissions: ["SELECT"]
+      Resource:
+        TableResource:
+          CatalogId: !GetAtt ExecuteMetadataFinder.Catalog
+          DatabaseName: !GetAtt ExecuteMetadataFinder.NameSpace
+          TableWildcard: {}
+       
   AthenaWorkGroup:
     Type: "AWS::Athena::WorkGroup"
     Properties:
@@ -377,6 +413,151 @@ Resources:
       RecursiveDeleteOption: true
       WorkGroupConfiguration: 
         EnforceWorkGroupConfiguration: false 
+
+  MetadataFinder:
+    Type: "AWS::Lambda::Function"
+    Condition: CreateInventoryFromMetadata
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 60
+      Handler: "index.handler"
+      Role: !GetAtt MetadataFinderRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import boto3
+          import botocore.exceptions
+          
+          def handler(event, context):
+          
+            if event["RequestType"] != "Create":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            
+            sts = boto3.client("sts")
+            account_id = sts.get_caller_identity()["Account"]
+              
+            response_data = {
+              "Catalog" : account_id,
+              "NameSpace" : "default",
+              "Journal" : "",
+              "Inventory" : ""
+            }
+            
+            use_metadata = event["ResourceProperties"]["UseMetadata"]
+            
+            if (use_metadata != "YES"):
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                return
+                
+            try:
+            
+              s3 = boto3.client("s3")
+              response = s3.get_bucket_metadata_configuration(Bucket = bucket)["GetBucketMetadataConfigurationResult"]["MetadataConfigurationResult"]
+              
+              reasons = []
+              
+              state = response["JournalTableConfigurationResult"]["TableStatus"]
+              if state != "ACTIVE":
+                reasons.append(f"Journal table configuration state is {state}.")
+              
+              state = response["InventoryTableConfigurationResult"]["ConfigurationState"]
+              if state != "ENABLED":
+                reasons.append(f"Inventory table configuration state is {state}.")
+              else:
+                state = response["InventoryTableConfigurationResult"]["TableStatus"]
+                if state != "ACTIVE":
+                  reasons.append(f"Inventory table status is {state}.")
+              
+              if reasons:
+                reason = "Could not read Metadata. " + " ".join(reasons)
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)         
+                return
+              
+              response_data = {
+                "Catalog" : f"{account_id}:s3tablescatalog/aws-s3",
+                "NameSpace" : response["DestinationResult"]["TableNamespace"],
+                "Journal" : response["JournalTableConfigurationResult"]["TableName"],
+                "Inventory" : response["InventoryTableConfigurationResult"]["TableName"]
+              }
+                
+              # Now need to check inventory or journal isn't KMS encrypted.
+              s3tables = boto3.client("s3tables")
+              
+              for t in ["Inventory", "Journal"]:
+              
+                table_name = response_data[t]
+                enc_response = s3tables.get_table_encryption(
+                  tableBucketARN = response["DestinationResult"]["TableBucketArn"],
+                  namespace = response_data["NameSpace"],
+                  name = response_data[t]
+                )["encryptionConfiguration"]
+                
+                if enc_response["sseAlgorithm"] == "aws:kms":
+                
+                  reason = f"Cannot read S3 Metadata. {t} table is encrypted with KMS key {enc_response['kmsKeyArn']}"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)         
+                  return
+              
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              return
+            
+            except botocore.exceptions.ClientError as error:
+              
+              if error.response['Error']['Code'] == "MetadataConfigurationNotFound":
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                return
+              
+              if error.response['Error']['Code'] == "NoSuchBucket":
+                reason = f"Bucket '{bucket}' does not exist."
+              else:
+                reason = f"Querying Metadata for bucket '{bucket}' failed: {error.response['Error']['Code']} {error.response['Error']['Message']}"
+              
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)         
+              return
+
+  MetadataFinderRole:
+    Type: "AWS::IAM::Role"
+    Condition: CreateInventoryFromMetadata
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketMetadataTableConfiguration"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+              - Effect: Allow
+                Action:
+                  - "s3tables:GetTableEncryption"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
 
   InventoryFinder:
     Type: "AWS::Lambda::Function"
@@ -401,6 +582,22 @@ Resources:
           
             if event["RequestType"] != "Create":
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            
+            # Have we already found a Metadata config?
+            # If so, return dummy inventory data so we don't break creation of subsequent queries / IAM Roles.
+            
+            if event["ResourceProperties"]["NameSpace"] != "default":
+                  
+              response_data = {
+                "DateTime" : "",
+                "InventoryLocation" : "",
+                "InventoryArn" : event["ResourceProperties"]["ResultsBucketArn"],
+                "Serde" : "",
+                "InventorySource" : "S3 Metadata"
+              }
+            
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
               return
             
             fields = set(["LastModifiedDate", "StorageClass", "ETag", "ChecksumAlgorithm", "ObjectOwner"])
@@ -474,6 +671,7 @@ Resources:
             bad_scope = False
             for inv in invs:
               
+              id = inv["Id"]
               d = inv["Destination"]["S3BucketDestination"]
               inv_bucket = d["Bucket"].split(":")[5]
               bucket_loc = f'{d["Prefix"]}/' if d.get("Prefix") else ""
@@ -505,7 +703,8 @@ Resources:
                     "DateTime" : result.group(1),
                     "InventoryLocation" : f"s3://{inv_bucket}/{prefix[:-3]}",
                     "InventoryArn" : f"arn:{partition}:s3:::{inv_bucket}",
-                    "Serde" : serde_map[d["Format"]]
+                    "Serde" : serde_map[d["Format"]],
+                    "InventorySource" : f"S3 Inventory with id '{id}'"
                   }
                   break
             
@@ -518,7 +717,12 @@ Resources:
                 reason += " At least one inventory was ignored because its destination prefix has a leading or trailing '/' character."
               
               if (bad_scope):
-                reason += " At least one inventory was ignored because its scope didn't include '{scope}."
+                if scope:
+                  scope = " the whole bucket."
+                else:
+                  scope = f" the Prefix '{scope}'."
+                
+                reason += f" At least one inventory was ignored because its scope didn't include '{scope}."
               
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
               return
@@ -660,7 +864,7 @@ Resources:
                 Resource:
                   - !Join [ "", [ !GetAtt AthenaResultsBucket.Arn, "/ImportCSV/inventory.csv" ] ]
 
-  CreatePITTable:
+  CreateInventoryPITTable:
     Type: "AWS::Athena::NamedQuery"
     Condition: CreateInventory
     Properties:
@@ -779,7 +983,6 @@ Resources:
                 write_compression = 'SNAPPY'
             ) AS
             SELECT
-                bucket,
                 url_decode(key) key,
                 version_id,
                 is_delete_marker,
@@ -793,6 +996,291 @@ Resources:
                 ${GlueDB}.csv_import
 
         - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+
+  CreateMetadataPITTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: CreateInventoryFromMetadata
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates the initial Point in Time table based on the bucket's Metadata table"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates the initial Point in Time table based on the bucket's Metadata table
+
+            CREATE TABLE ${GlueDB}.pit_table WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/pit_table/',
+                write_compression = 'SNAPPY'
+            ) AS
+                    
+            (
+                WITH my_inventory AS (
+                    SELECT 
+                        key,
+                        version_id,
+                        is_delete_marker,
+                        CAST(last_modified_date AS timestamp(3)) as last_modified_date,
+                        size,
+                        storage_class,
+                        sequence_number
+                    FROM
+                        "s3tablescatalog/aws-s3"."${NameSpace}"."${Inventory}" inventory
+                    WHERE
+                        key LIKE '${Prefix}%'
+                ),
+                
+                -- 
+                -- Load journal events that may not yet have been processed into inventory.
+                -- For safety, we include events up to 1 hour prior to the start of the last coalesce task.
+                --
+                my_new_events as (
+                    SELECT
+                        *
+                    FROM (
+                        WITH inventory_time_cte AS
+                    
+                        (
+                            SELECT
+                                COALESCE(inventory_time_from_property - INTERVAL '1' HOUR, inventory_time_default) AS inventory_time
+                            FROM (
+                                SELECT
+                                    *
+                                FROM
+                                -- The fallback default includes the entirety of the journal table.
+                                (VALUES (TIMESTAMP '2024-12-01 00:00')) AS T (inventory_time_default)
+                                LEFT OUTER JOIN
+                                -- This side queries the Iceberg table property.
+                                (
+                                    SELECT
+                                        from_unixtime(CAST(value AS BIGINT)/1000) AS inventory_time_from_property 
+                                    FROM
+                                        "s3tablescatalog/aws-s3"."${NameSpace}"."${Journal}$properties"
+                                    WHERE
+                                        key = 'aws.s3metadata.oldest-uncoalesced-record-timestamp' 
+                                    LIMIT 1
+                                )
+                                -- Force an unequivocal join.
+                                ON TRUE
+                            )
+                        )
+                        
+                        -- Find the journal table entries that may not yet have been coalesced
+                        SELECT 
+                            key,
+                            version_id,
+                            is_delete_marker,
+                            CAST(last_modified_date AS timestamp(3)) as last_modified_date,
+                            size,
+                            storage_class,
+                            CAST(record_timestamp AS timestamp(3)) as record_timestamp,
+                            record_type,
+                            sequence_number
+                        FROM
+                            "s3tablescatalog/aws-s3"."${NameSpace}"."${Journal}" journal
+                        CROSS JOIN
+                            inventory_time_cte t
+                        WHERE
+                            journal.record_timestamp >= t.inventory_time
+                    )
+                    WHERE
+                        key LIKE '${Prefix}%'
+                ),
+                
+                latest_permanent_deletes AS (
+                    -- Find the journal records for permanent deletes, keeping only the highest sequence_number for each key, version_id pair. Bear in mind these DELETE operations can succeed created regardless of the presence of a matching pair in the bucket, and will therefore create a journal entry.
+                    SELECT DISTINCT
+                        key,
+                        version_id,
+                        is_delete_marker,
+                        FIRST_VALUE(record_timestamp) OVER (PARTITION BY key, version_id ORDER BY sequence_number DESC) as latest_delete_timestamp,
+                        MAX(sequence_number) OVER (PARTITION BY key, version_id) as latest_delete_sequence
+                    FROM
+                        my_new_events
+                    WHERE
+                        record_type = 'DELETE'
+                        AND COALESCE(is_delete_marker, FALSE) = FALSE
+                    
+                    UNION ALL
+                    
+                    -- Create dummy permanent delete records for CREATE records with NULL version_id,
+                    -- i.e. object overwrites where versioning is not enabled.
+                    -- These records will cause existing inventory entries with NULL version_id to be filtered out,
+                    -- and allow the newer CREATE record to replace them.
+                    SELECT DISTINCT
+                        key,
+                        version_id,  -- This will be NULL for non-versioned buckets
+                        FALSE as is_delete_marker,  -- Dummy deletes are not delete markers
+                        CAST(last_modified_date AS timestamp(3)) as latest_delete_timestamp,  -- Use same timestamp as CREATE
+                        -- Since sequence_number is varchar, create a sequence that sorts just before the CREATE sequence
+                        -- Prepend with a character that sorts early in ASCII (space sorts before most characters)
+                        ' ' || sequence_number as latest_delete_sequence
+                    FROM
+                        my_new_events
+                    WHERE
+                        record_type = 'CREATE' AND version_id IS NULL
+                ),
+                
+                deduplicated_journal AS (
+                    -- Deduplicate journal records, keeping only the highest sequence_number for duplicates, excluding permanent deletes
+                    SELECT
+                        *
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY key, version_id, is_delete_marker, size, last_modified_date
+                                ORDER BY sequence_number DESC
+                            ) as rn
+                        FROM
+                            my_new_events
+                        WHERE
+                            last_modified_date IS NOT NULL  -- Only deduplicate non-null records
+                            AND is_delete_marker IS NOT NULL
+                            AND size IS NOT NULL
+                    ) ranked
+                    
+                    WHERE
+                        rn = 1
+                    
+                    UNION ALL
+                    
+                    -- Include permanent delete records (these don't participate in deduplication)
+                    SELECT
+                        *,
+                        1 as rn
+                    FROM
+                        my_new_events
+                    WHERE
+                        last_modified_date IS NULL
+                        OR is_delete_marker IS NULL
+                        OR size IS NULL
+                ),
+                
+                journal_filtered AS (
+                    -- Filter deduplicated journal records, to new entries for the inventory.
+                    -- Permanent deletes (including dummy deletes) are used to filter out journal entries that don't need to be added
+                    -- The dummy deletes created above will naturally handle CREATE with NULL version_id replacement logic
+                    SELECT 
+                        j.key,
+                        j.version_id,
+                        j.last_modified_date,
+                        j.is_delete_marker,
+                        j.size,
+                        j.storage_class,
+                        j.sequence_number,
+                        j.record_timestamp,
+                        j.record_type,
+                        'journal' as source_table
+                    FROM
+                        deduplicated_journal j
+                    LEFT JOIN
+                        latest_permanent_deletes lpd 
+                        ON
+                        j.key = lpd.key
+                        AND j.version_id IS NOT DISTINCT FROM lpd.version_id
+                    LEFT JOIN my_inventory inv
+                        ON j.key = inv.key
+                        AND j.version_id IS NOT DISTINCT FROM inv.version_id
+                    WHERE 
+                        -- Exclude all permanent delete records from output (including dummy deletes)
+                        NOT (j.record_type = 'DELETE' AND COALESCE(j.is_delete_marker, FALSE) = FALSE)
+                        AND
+                        -- Exclude journal records superseded by permanent deletes (including dummy deletes)
+                        lpd.key IS NULL
+                        AND
+                        -- Exclude journal records that already exist in inventory (exact key+version_id match)
+                        -- Exception: Include CREATE records with NULL version_id even if they match inventory, because the dummy deletes
+                        --  will remove the old inventory entries, allowing replacement by these keyname overwrite operations
+                        (inv.key IS NULL OR (j.record_type = 'CREATE' AND j.version_id IS NULL))
+                ),
+                -- We now have a clean set of new rows to add to our inventory. But first we need to remove deleted rows from our inventory:
+                inventory_filtered AS (
+                    -- Filter inventory records against latest permanent deletes (including dummy deletes where version_ID is null)
+                    SELECT
+                        i.*,
+                        'inventory' as source_table
+                    FROM
+                        my_inventory i
+                    LEFT JOIN
+                        latest_permanent_deletes lpd 
+                        ON i.key = lpd.key AND i.version_id IS NOT DISTINCT FROM lpd.version_id
+                    WHERE
+                        lpd.key IS NULL
+                        OR NOT (
+                            CASE 
+                                WHEN lpd.latest_delete_timestamp > i.last_modified_date + INTERVAL '1' SECOND
+                                    THEN TRUE
+                                WHEN lpd.latest_delete_timestamp BETWEEN i.last_modified_date - INTERVAL '1' SECOND AND i.last_modified_date + INTERVAL '1' SECOND
+                                --use sequence number to decide order, if the permanent delete record_timestamp is close to the inventory row's last_modified_date. 
+                                    THEN lpd.latest_delete_sequence > i.sequence_number 
+                                ELSE
+                                    FALSE
+                            END
+                        )
+                ),
+            
+                -- Now we can combine the tables:
+                coalesced_inventory as (
+                    SELECT 
+                        key,
+                        version_id,
+                        is_delete_marker,
+                        last_modified_date,
+                        size,
+                        storage_class,
+                        sequence_number
+                    FROM
+                        inventory_filtered
+                    
+                    UNION ALL
+                    
+                    SELECT 
+                        key,
+                        version_id,
+                        is_delete_marker,
+                        last_modified_date,
+                        size,
+                        storage_class,
+                        sequence_number
+                    FROM
+                        journal_filtered
+                ),
+                
+                --
+                -- Now we can determine the current version for each key by sorting by sequence number:
+                -- Only one record per key will have is_latest = TRUE
+                --
+                inventory_with_is_latest as (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY key 
+                            ORDER BY sequence_number DESC
+                        ) = 1 AS is_latest
+                    FROM
+                        coalesced_inventory
+                )
+                --
+                -- Output the desired columns 
+                --
+                SELECT
+                    key,
+                    version_id,
+                    is_delete_marker,
+                    is_latest,
+                    last_modified_date,
+                    size,
+                    storage_class,
+                    '' as intelligent_tiering_access_tier,
+                    '' dt
+                FROM inventory_with_is_latest
+            )
+            
+        - GlueDB: !Ref GlueDatabase
+          NameSpace: !GetAtt ExecuteMetadataFinder.NameSpace
+          Inventory: !GetAtt ExecuteMetadataFinder.Inventory
+          Journal: !GetAtt ExecuteMetadataFinder.Journal
           ResultsBucket: !Ref AthenaResultsBucket
 
   CreateAllVersionsTable:
@@ -825,13 +1313,11 @@ Resources:
                 ${GlueDB}.pit_table
             WHERE
                 dt = '${DateTime}' and
-                starts_with(key, '${Prefix}') and
-                bucket = '${SourceBucket}'
+                starts_with(key, '${Prefix}')
                 
         - DateTime: !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.DateTime, "" ]
           GlueDB: !Ref GlueDatabase
           ResultsBucket: !Ref AthenaResultsBucket
-          SourceBucket: !Ref BucketName
           Prefix: !Ref Prefix
 
   CreateAllKeysTable:
@@ -1656,6 +2142,13 @@ Resources:
               if event["RequestType"] != "Create":
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
                   return
+              
+              # Some queries should / should not be executed if we've found a Metadata configuration.
+              # No easy way to do this natively in CloudFormation, so we have to hard-code checks here.
+              if ( (event["ResourceProperties"].get("SkipIfMetadataFound") and event["ResourceProperties"].get("NameSpace") != "default") or
+                   (event["ResourceProperties"].get("OnlyIfMetadataFound") and event["ResourceProperties"].get("NameSpace") == "default") ):
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"State" : "SUCCEEDED"})
+                  return
                   
               query_id = event["ResourceProperties"]["QueryID"]
               
@@ -1745,13 +2238,20 @@ Resources:
                 Action:
                   - "glue:CreateDatabase"
                   - "glue:CreateTable"
-                  - "glue:GetTable"
-                  - "glue:GetDatabase"
-                  - "glue:GetPartition"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*"
+              - Effect: Allow
+                Action:
+                  - "glue:Get*"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - "lakeformation:GetDataAccess"
+                Resource:
+                  - "*"
               - Effect: Allow
                 Action:
                   - "s3:GetObject"
@@ -2387,29 +2887,58 @@ Resources:
       ServiceToken: !GetAtt BucketCleaner.Arn
       Bucket: !Ref AthenaResultsBucket
 
+  ExecuteMetadataFinder:
+    Type: "Custom::ExecuteMetadataFinderFunction"
+    Condition: CreateInventoryFromMetadata
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt MetadataFinder.Arn
+      Bucket: !Ref BucketName
+      UseMetadata: !Ref UseMetadata
+     
   ExecuteInventoryFinder:
     Type: "Custom::ExecuteInventoryFinderFunction"
     Condition: CreateInventory
-    DependsOn:
-    - ExecuteClean
     Properties:
       ServiceTimeout: 60
       ServiceToken: !GetAtt InventoryFinder.Arn
       Bucket: !Ref BucketName
       Prefix: !Ref Prefix
       TimeStamp: !Ref TimeStamp
+      NameSpace: !If [ CreateInventoryFromMetadata, !GetAtt ExecuteMetadataFinder.NameSpace, "default" ]
+      ResultsBucketArn: !GetAtt AthenaResultsBucket.Arn
       
-  ExecuteCreatePITTable:
-    Type: "Custom::ExecuteCreatePITTableFunction"
+  ExecuteCreateInventoryPITTable:
+    Type: "Custom::ExecuteCreateInventoryPITTableFunction"
     Condition: CreateInventory
     DependsOn:
     - ExecuteClean
     Properties:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreatePITTable.NamedQueryId
+      QueryID: !GetAtt CreateInventoryPITTable.NamedQueryId
       WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreatePITTable/"
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateInventoryPITTable/"
+      SkipIfMetadataFound: true
+      NameSpace: !If [ CreateInventoryFromMetadata, !GetAtt ExecuteMetadataFinder.NameSpace, "default" ]
+
+  ExecuteCreateMetadataPITTable:
+    Type: "Custom::ExecuteCreateMetadataPITTableFunction"
+    Condition: CreateInventoryFromMetadata
+    DependsOn:
+    - ExecuteClean
+    - GluePermissions
+    - S3TablesPermissions
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateMetadataPITTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateMetadataPITTable/"
+      OnlyIfMetadataFound: true
+      NameSpace: !GetAtt ExecuteMetadataFinder.NameSpace
 
   ExecuteInventoryCopier:
     Type: "Custom::ExecuteCreateCSVImportTableFunction"
@@ -2471,7 +3000,9 @@ Resources:
       QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateAllVersionsTable/"
-      Dependency: !If [ CreateInventory, !GetAtt ExecuteCreatePITTable.State, !GetAtt ExecuteCreateCSVPITTable.State ]
+      Dependency:
+        - !If [ CreateInventory, !GetAtt ExecuteCreateInventoryPITTable.State, !GetAtt ExecuteCreateCSVPITTable.State ]
+        - !If [ CreateInventoryFromMetadata, !GetAtt ExecuteCreateMetadataPITTable.State, !Ref "AWS::NoValue" ]
 
   ExecuteCreateLatestVersionsTable:
     Type: "Custom::ExecuteCreateLatestVersionsTableFunction"
@@ -2893,3 +3424,7 @@ Outputs:
     Condition: WantDMRemoval
     Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 4)
     Value: !GetAtt ExecuteS3BatchOpsDeleteCreator4.Output
+
+  InventorySource:
+    Description: Where was the bucket inventory read from?
+    Value: !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.InventorySource, !Ref InventoryCSVLocation ]
