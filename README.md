@@ -224,13 +224,13 @@ The table below compares the behaviour of the Bucket Rollback and Delete Marker 
 
 | Operations before tD | Operations after tD | Bucket Rollback Mode behaviour | Remove Delete Marker mode behaviour |
 |---|---|---|---|
-| V1 | DM1 | Delete DM1 | Delete DM1
-| *None* | V1, DM1 | *No action* | Delete DM1 |
-| V1, DM1 | V2, DM2 | *No action* | Delete DM2 |
-| V1, DM1 | DM2 | *No action* | Delete DM2 |
-| V1 | DM1, V2, DM2 | Copy V1 | Delete DM2 |
-| V1 | V2 | Copy V1 | *No action*
-| *None*| V1 | Place DM | *No action*
+| V1 | DM1 | Delete DM1, exposing V1 | Delete DM1, exposing V1
+| *None* | V1, DM1 | *No action* | Delete DM1, exposing V1 |
+| V1, DM1 | V2, DM2 | *No action* | Delete DM2, exposing V2 |
+| V1, DM1 | DM2 | *No action* | Delete DM2, object remains soft-deleted due to DM1 |
+| V1 | DM1, V2, DM2 | Copy V1 | Delete DM2, exposing V2 |
+| V1 | V2 | Copy V1 (as current version V3) | *No action*
+| *None*| V1 | Place DM, key is soft deleted | *No action*
 
 
 ### Copy to Bucket mode
@@ -375,7 +375,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
         - To simply delete all delete markers placed after tD, select the dedicated **Remove Delete Markers** mode during deployment.
         - Or, if you only want to remove delete markers from objects that were present (with a current version that was not a delete marker) at tD, select the default **Bucket Rollback** mode, leave **Start S3 Batch Operations Jobs** as `FALSE`, and then only run the scenario 2 job. Note this will not act on keys where an object has been PUT after tD, as this falls under scenario 3.
 9. Does this work with S3 Replication?
-    - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket. Note that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
+    - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket. Note that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional and not available for tag-filtered replication rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
     - If you want to roll back both source and destination buckets:
         1. Ensure replication of delete markers is enabled in your replication rule.
         2. Roll back the source bucket to tD, running all Batch Operations jobs. The operations carried out by the Scenario 1 and 3 jobs will be replicated.
@@ -384,6 +384,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
         1. [Disable the replication rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-add-config.html#replication-config-min-rule-config) to prevent further replication from source to destination.
         2. Using an inventory that includes all replicated changes, roll back the destination bucket to tD.
     - You may also want to consider using the [Replication Validation Tool for S3](https://github.com/aws-samples/sample-RVT-S3) to continuously validate that your destination bucket (or prefix) is a complete copy of your source.
+    - Note that the tool uses the 'last modified' date of each object (i.e. when it was created), and this date is maintained when objects are replicated. Therefore, when rolling back a destination bucket you need to be conscious that actions are calculated according to the date an object was *created*, **not** the date it was *replicated*.
 10. For 'Copy to Bucket' mode, why does the destination bucket need S3 Versioning enabled?
     - This tool will copy objects into the destination bucket without considering the current state of objects in the destination. If versioning is not enabled, these copies could result in overwrites causing permanent and irreversable data loss.
 
